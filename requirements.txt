@@ -1,7 +1,5 @@
 streamlit>=1.30.0
 numpy<2.0.0
-opencv-python-headless
-face-recognition
-supabase
-Pillow
-requests
+opencv-python-headless>=4.9.0.80
+Pillow>=10.0.0
+requests>=2.28.0

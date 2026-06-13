@@ -1,18 +1,26 @@
 import streamlit as st
 import os
-import cv2
-import numpy as np
 import base64
 import hashlib
-import requests
 
+SUPABASE_AVAILABLE = True
 try:
     import supabase_db as db
-    SUPABASE_AVAILABLE = True
 except Exception:
     SUPABASE_AVAILABLE = False
 
-HAS_FACE_RECOGNIZER = hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create')
+CV2_AVAILABLE = False
+HAS_FACE_RECOGNIZER = False
+np = None
+cv2 = None
+
+try:
+    import numpy as np
+    import cv2
+    CV2_AVAILABLE = True
+    HAS_FACE_RECOGNIZER = hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create')
+except Exception:
+    pass
 
 DB_PATH = "students.db"
 IMG_FOLDER = "registered_faces"
@@ -66,8 +74,6 @@ SEMESTERS_LIST = [f"Semester {i}" for i in range(1, 11)]
 for key, val in {"logged_in": False, "supabase_url": "", "supabase_key": ""}.items():
     if key not in st.session_state:
         st.session_state[key] = val
-
-IS_CLOUD = not os.path.exists(DB_PATH) or os.access("/", os.W_OK) is False
 
 def get_local_db_hash():
     if not os.path.exists(DB_PATH):
@@ -125,6 +131,7 @@ def delete_local_student(adm_id):
     conn.commit()
     conn.close()
 
+
 FACE_SIZE = (150, 150)
 
 def align_and_resize_face(gray_img, x, y, w, h):
@@ -143,11 +150,10 @@ def opencv_to_base64(img):
     _, buf = cv2.imencode('.jpg', img)
     return base64.b64encode(buf).decode()
 
-
 def train_from_records(records, use_url=False):
     if not HAS_FACE_RECOGNIZER:
         return None, {}
-
+    import requests
     face_samples = []
     ids = []
     id_map = {}
@@ -181,46 +187,44 @@ def train_from_records(records, use_url=False):
     return recognizer, id_map
 
 
-st.sidebar.title("🏫 PTU Systems")
+st.sidebar.title("PTU Systems")
 
 use_supabase = bool(st.session_state.get("supabase_url") and SUPABASE_AVAILABLE)
 
-if use_supabase:
-    st.sidebar.success("☁️ Supabase: Connected")
-elif IS_CLOUD:
-    st.sidebar.warning("☁️ Cloud Mode (Connect Supabase for full features)")
+if CV2_AVAILABLE:
+    st.sidebar.success("Camera: Ready")
 else:
-    st.sidebar.warning("📦 Mode: Local SQLite")
+    st.sidebar.warning("Camera: Not Available")
 
-menu = ["📸 Face Scanner", "🔒 Admin Panel"]
+if use_supabase:
+    st.sidebar.success("Database: Supabase")
+else:
+    st.sidebar.info("Database: Local SQLite")
+
+menu = ["Face Scanner", "Admin Panel"]
 choice = st.sidebar.selectbox("Navigation", menu)
 
 
-if not HAS_FACE_RECOGNIZER:
-    st.sidebar.error("⚠️ cv2.face not available. Recognition disabled.")
+if choice == "Face Scanner":
+    st.header("Face Verification")
+    st.caption("Take a photo or upload an image to verify against the database.")
 
-
-if choice == "📸 Face Scanner":
-    st.header("👁 Real-Time Face Verification")
-    st.caption("Take a photo or upload an image. The system detects faces and matches them against the database.")
+    if not CV2_AVAILABLE:
+        st.error("OpenCV is not installed. Face detection requires OpenCV. Run: `pip install opencv-python-headless numpy`")
+        st.stop()
 
     cam_col, data_col = st.columns([1.1, 1])
 
     with cam_col:
-        st.subheader("📹 Camera Feed")
-
-        if IS_CLOUD and not use_supabase:
-            st.info("Camera requires Supabase connection in cloud mode. Please upload a photo below.")
-            img_file = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"], key="cloud_upload")
-        else:
-            img_file = st.camera_input("Look at the camera and click 'Take Photo'")
-            if img_file is None:
-                st.markdown("---")
-                st.markdown("**Or upload a photo:**")
-                img_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"], key="fallback_upload")
+        st.subheader("Camera")
+        img_file = st.camera_input("Click 'Take Photo' to capture")
+        if img_file is None:
+            st.markdown("---")
+            st.markdown("**Or upload a photo:**")
+            img_file = st.file_uploader("Choose an image file", type=["jpg", "jpeg", "png"])
 
     with data_col:
-        st.subheader("🔍 Scan Result")
+        st.subheader("Result")
         profile_placeholder = st.empty()
 
         if img_file is not None:
@@ -237,7 +241,7 @@ if choice == "📸 Face Scanner":
                 st.image(f"data:image/jpeg;base64,{b64_img}", caption=f"{len(faces)} face(s) detected", use_container_width=True)
 
                 if not HAS_FACE_RECOGNIZER:
-                    profile_placeholder.warning("Face detection works but recognition requires opencv-contrib. Install it with: `pip install opencv-contrib-python-headless`")
+                    profile_placeholder.warning("Face detected but recognition unavailable. Install opencv-contrib-python-headless for recognition.")
                 else:
                     cache_key = "sb_hash" if use_supabase else "local_hash"
                     recognizer_key = "sb_recognizer" if use_supabase else "local_recognizer"
@@ -277,8 +281,7 @@ if choice == "📸 Face Scanner":
                                     matched_student = (s.get("admission_id"), s.get("name"), s.get("roll_no"),
                                                        s.get("department"), s.get("semester"), s.get("image_url", ""))
                             else:
-                                rows = get_local_students()
-                                for r in rows:
+                                for r in get_local_students():
                                     if r[0] == target_id:
                                         matched_student = r
                                         break
@@ -317,12 +320,11 @@ if choice == "📸 Face Scanner":
                         </div>
                         """, unsafe_allow_html=True)
             else:
-                profile_placeholder.error("No face detected in the image. Please try again.")
+                profile_placeholder.error("No face detected. Please try again.")
         else:
-            profile_placeholder.info("Position your face in front of the camera and click 'Take Photo'.")
+            profile_placeholder.info("Position your face and click 'Take Photo'.")
 
-
-elif choice == "🔒 Admin Panel":
+elif choice == "Admin Panel":
     if st.session_state.logged_in:
         st.sidebar.success("Logged in as Admin")
         if st.sidebar.button("Logout"):
@@ -415,9 +417,8 @@ elif choice == "🔒 Admin Panel":
                     s = db.get_student_by_id(target_id)
                     curr_data = (s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) if s else None
                 else:
-                    rows = get_local_students()
                     curr_data = None
-                    for r in rows:
+                    for r in get_local_students():
                         if r[0] == target_id:
                             curr_data = (r[1], r[2], r[3], r[4], r[5])
                             break
@@ -491,90 +492,74 @@ elif choice == "🔒 Admin Panel":
             st.markdown("Configure your Supabase connection for cloud database storage.")
 
             if not SUPABASE_AVAILABLE:
-                st.error("Supabase library not installed. Add `supabase` to requirements.txt")
-
-            with st.expander("How to set up Supabase", expanded=not bool(st.session_state.get("supabase_url"))):
-                st.markdown("""
-                **Steps:**
-                1. Go to [supabase.com](https://supabase.com) and create a free account
-                2. Create a new project
-                3. Go to **SQL Editor** and run this SQL to create the table:
-                ```sql
-                CREATE TABLE students (
-                    admission_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    roll_no TEXT NOT NULL,
-                    department TEXT NOT NULL,
-                    semester TEXT NOT NULL,
-                    image_url TEXT
-                );
-                ALTER TABLE students ENABLE ROW LEVEL SECURITY;
-                CREATE POLICY "Allow all" ON students FOR ALL USING (true) WITH CHECK (true);
-                ```
-                4. Go to **Storage** and create a bucket named `registered_faces` (set it to public)
-                5. Copy your **Project URL** and **anon/public Key** from Settings > API
-                6. Paste them below
-                """)
-
-            with st.form("api_form"):
-                supabase_url = st.text_input(
-                    "Supabase Project URL",
-                    value=st.session_state.get("supabase_url", ""),
-                    placeholder="https://xxxxx.supabase.co"
-                )
-                supabase_key = st.text_input(
-                    "Supabase Anon Key",
-                    value=st.session_state.get("supabase_key", ""),
-                    placeholder="eyJhbGciOiJIUzI1NiIs...",
-                    type="password"
-                )
-
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    if st.form_submit_button("Save & Connect", type="primary"):
-                        st.session_state["supabase_url"] = supabase_url.strip()
-                        st.session_state["supabase_key"] = supabase_key.strip()
-                        for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
-                            st.session_state.pop(k, None)
-                        if supabase_url.strip() and supabase_key.strip():
-                            ok, msg = db.test_connection()
-                            if ok:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
-                        else:
-                            st.warning("Please enter both URL and Key.")
-                with col2:
-                    if st.form_submit_button("Test Connection"):
-                        st.session_state["supabase_url"] = supabase_url.strip()
-                        st.session_state["supabase_key"] = supabase_key.strip()
-                        ok, msg = db.test_connection()
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-                with col3:
-                    if st.form_submit_button("Disconnect (Use Local)"):
-                        st.session_state["supabase_url"] = ""
-                        st.session_state["supabase_key"] = ""
-                        for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
-                            st.session_state.pop(k, None)
-                        st.info("Switched to local SQLite mode.")
-                        st.rerun()
-
-            st.write("---")
-            st.subheader("Connection Status")
-            if st.session_state.get("supabase_url"):
-                st.markdown("**Mode:** Cloud (Supabase)")
-                st.markdown(f"**URL:** `{st.session_state.get('supabase_url', '')}`")
-                ok, msg = db.test_connection()
-                if ok:
-                    st.markdown("**Status:** <span class='status-ok'>Connected</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown(f"**Status:** <span class='status-err'>Error - {msg}</span>", unsafe_allow_html=True)
+                st.error("Supabase library is not installed. Add `supabase` to requirements.txt and redeploy.")
             else:
-                st.markdown("**Mode:** Local SQLite")
-                st.markdown("**Status:** <span class='status-ok'>Active (Offline Mode)</span>", unsafe_allow_html=True)
+                with st.expander("How to set up Supabase", expanded=not bool(st.session_state.get("supabase_url"))):
+                    st.markdown("""
+                    **Steps:**
+                    1. Go to [supabase.com](https://supabase.com) and create a free account
+                    2. Create a new project
+                    3. Go to **SQL Editor** and run:
+                    ```sql
+                    CREATE TABLE students (
+                        admission_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        roll_no TEXT NOT NULL,
+                        department TEXT NOT NULL,
+                        semester TEXT NOT NULL,
+                        image_url TEXT
+                    );
+                    ALTER TABLE students ENABLE ROW LEVEL SECURITY;
+                    CREATE POLICY "Allow all" ON students FOR ALL USING (true) WITH CHECK (true);
+                    ```
+                    4. Go to **Storage** -> create bucket `registered_faces` (public)
+                    5. Copy **Project URL** + **Anon Key** from Settings > API
+                    """)
+
+                with st.form("api_form"):
+                    supabase_url = st.text_input("Supabase Project URL",
+                        value=st.session_state.get("supabase_url", ""),
+                        placeholder="https://xxxxx.supabase.co")
+                    supabase_key = st.text_input("Supabase Anon Key",
+                        value=st.session_state.get("supabase_key", ""),
+                        placeholder="eyJhbGciOiJIUzI1NiIs...",
+                        type="password")
+
+                    cols = st.columns(3)
+                    with cols[0]:
+                        if st.form_submit_button("Save & Connect", type="primary"):
+                            st.session_state["supabase_url"] = supabase_url.strip()
+                            st.session_state["supabase_key"] = supabase_key.strip()
+                            for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
+                                st.session_state.pop(k, None)
+                            if supabase_url.strip() and supabase_key.strip():
+                                ok, msg = db.test_connection()
+                                st.success(msg) if ok else st.error(msg)
+                    with cols[1]:
+                        if st.form_submit_button("Test Connection"):
+                            st.session_state["supabase_url"] = supabase_url.strip()
+                            st.session_state["supabase_key"] = supabase_key.strip()
+                            ok, msg = db.test_connection()
+                            st.success(msg) if ok else st.error(msg)
+                    with cols[2]:
+                        if st.form_submit_button("Disconnect"):
+                            st.session_state["supabase_url"] = ""
+                            st.session_state["supabase_key"] = ""
+                            for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
+                                st.session_state.pop(k, None)
+                            st.rerun()
+
+                st.write("---")
+                st.subheader("Connection Status")
+                url_set = bool(st.session_state.get("supabase_url"))
+                if url_set:
+                    st.markdown("**Mode:** Cloud (Supabase)")
+                    ok, msg = db.test_connection()
+                    tag = "status-ok" if ok else "status-err"
+                    st.markdown(f"**Status:** <span class='{tag}'>{'Connected' if ok else msg}</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown("**Mode:** Local SQLite")
+                    st.markdown("**Status:** <span class='status-ok'>Active</span>", unsafe_allow_html=True)
 
     else:
         st.subheader("Admin Login")
