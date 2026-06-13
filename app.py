@@ -1,15 +1,18 @@
 import streamlit as st
-import sqlite3
 import os
 import cv2
 import numpy as np
 import base64
 import hashlib
-import tempfile
 import requests
-from PIL import Image
 
-import supabase_db as db
+try:
+    import supabase_db as db
+    SUPABASE_AVAILABLE = True
+except Exception:
+    SUPABASE_AVAILABLE = False
+
+HAS_FACE_RECOGNIZER = hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create')
 
 DB_PATH = "students.db"
 IMG_FOLDER = "registered_faces"
@@ -32,11 +35,6 @@ st.markdown("""
         h2 { font-size: 1.2rem !important; }
         h3 { font-size: 1rem !important; }
     }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        padding: 10px 20px; border-radius: 8px 8px 0 0;
-        font-weight: 600;
-    }
     .profile-card-success {
         background: white; border-left: 6px solid #22c55e; padding: 18px;
         border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.06);
@@ -50,10 +48,6 @@ st.markdown("""
     .avatar-large {
         width: 90px; height: 90px; border-radius: 50%;
         object-fit: cover; border: 3px solid #e2e8f0;
-    }
-    .api-card {
-        background: #f8fafc; border: 1px solid #e2e8f0; padding: 20px;
-        border-radius: 12px; margin-bottom: 16px;
     }
     .status-ok { color: #16a34a; font-weight: bold; }
     .status-err { color: #dc2626; font-weight: bold; }
@@ -73,31 +67,63 @@ for key, val in {"logged_in": False, "supabase_url": "", "supabase_key": ""}.ite
     if key not in st.session_state:
         st.session_state[key] = val
 
-conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS students (
-        admission_id TEXT PRIMARY KEY,
-        name TEXT,
-        roll_no TEXT,
-        department TEXT,
-        semester TEXT,
-        image_path TEXT
-    )
-""")
-conn.commit()
-conn.close()
+IS_CLOUD = not os.path.exists(DB_PATH) or os.access("/", os.W_OK) is False
 
-st.sidebar.title("🏫 PTU Systems")
+def get_local_db_hash():
+    if not os.path.exists(DB_PATH):
+        return "empty"
+    try:
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT admission_id, image_path FROM students")
+        records = c.fetchall()
+        conn.close()
+        return hashlib.md5(str(records).encode()).hexdigest()
+    except Exception:
+        return "empty"
 
-if st.session_state.get("supabase_url"):
-    st.sidebar.success("☁️ Supabase: Connected")
-else:
-    st.sidebar.warning("📦 Mode: Local SQLite")
+def get_local_students():
+    import sqlite3
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT admission_id, name, roll_no, department, semester, image_path FROM students")
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
-menu = ["📸 Face Scanner", "🔒 Admin Panel"]
-choice = st.sidebar.selectbox("Navigation", menu)
+def save_local_student(adm_id, name, r_no, dept, seme, file_bytes=None, file_path=None):
+    import sqlite3
+    if file_bytes is not None and file_path:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS students (admission_id TEXT PRIMARY KEY, name TEXT, roll_no TEXT, department TEXT, semester TEXT, image_path TEXT)")
+    c.execute("INSERT OR REPLACE INTO students VALUES (?, ?, ?, ?, ?, ?)",
+              (adm_id, name, r_no, dept, seme, file_path or ""))
+    conn.commit()
+    conn.close()
 
+def delete_local_student(adm_id):
+    import sqlite3
+    if not os.path.exists(DB_PATH):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT image_path FROM students WHERE admission_id=?", (adm_id,))
+    row = c.fetchone()
+    if row and row[0] and os.path.exists(row[0]):
+        os.remove(row[0])
+    c.execute("DELETE FROM students WHERE admission_id=?", (adm_id,))
+    conn.commit()
+    conn.close()
 
 FACE_SIZE = (150, 150)
 
@@ -107,28 +133,21 @@ def align_and_resize_face(gray_img, x, y, w, h):
     face = cv2.equalizeHist(face)
     return face
 
-def get_local_db_hash():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT admission_id, image_path FROM students")
-    records = c.fetchall()
-    conn.close()
-    return hashlib.md5(str(records).encode()).hexdigest()
+def draw_face_boxes(opencv_img, faces):
+    for (x, y, w, h) in faces:
+        cv2.rectangle(opencv_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(opencv_img, "Face", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    return opencv_img
 
-def train_face_recognizer_local():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT admission_id, image_path FROM students")
-    records = c.fetchall()
-    conn.close()
-    return _train_from_records(records)
+def opencv_to_base64(img):
+    _, buf = cv2.imencode('.jpg', img)
+    return base64.b64encode(buf).decode()
 
-def train_face_recognizer_supabase():
-    students = db.get_all_students()
-    records = [(s["admission_id"], s.get("image_url", "")) for s in students]
-    return _train_from_records(records, use_url=True)
 
-def _train_from_records(records, use_url=False):
+def train_from_records(records, use_url=False):
+    if not HAS_FACE_RECOGNIZER:
+        return None, {}
+
     face_samples = []
     ids = []
     id_map = {}
@@ -162,30 +181,43 @@ def _train_from_records(records, use_url=False):
     return recognizer, id_map
 
 
-def draw_face_boxes(opencv_img, faces):
-    for (x, y, w, h) in faces:
-        cv2.rectangle(opencv_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(opencv_img, "Face", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    return opencv_img
+st.sidebar.title("🏫 PTU Systems")
 
-def opencv_to_base64(img):
-    _, buf = cv2.imencode('.jpg', img)
-    return base64.b64encode(buf).decode()
+use_supabase = bool(st.session_state.get("supabase_url") and SUPABASE_AVAILABLE)
+
+if use_supabase:
+    st.sidebar.success("☁️ Supabase: Connected")
+elif IS_CLOUD:
+    st.sidebar.warning("☁️ Cloud Mode (Connect Supabase for full features)")
+else:
+    st.sidebar.warning("📦 Mode: Local SQLite")
+
+menu = ["📸 Face Scanner", "🔒 Admin Panel"]
+choice = st.sidebar.selectbox("Navigation", menu)
+
+
+if not HAS_FACE_RECOGNIZER:
+    st.sidebar.error("⚠️ cv2.face not available. Recognition disabled.")
 
 
 if choice == "📸 Face Scanner":
     st.header("👁 Real-Time Face Verification")
-    st.caption("Take a photo or upload an image. The system will detect faces and match them against the database.")
+    st.caption("Take a photo or upload an image. The system detects faces and matches them against the database.")
 
     cam_col, data_col = st.columns([1.1, 1])
 
     with cam_col:
         st.subheader("📹 Camera Feed")
-        img_file = st.camera_input("Look at the camera and click 'Take Photo'")
-        if img_file is None:
-            st.markdown("---")
-            st.markdown("**Or upload a photo:**")
-            img_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"], key="fallback_upload")
+
+        if IS_CLOUD and not use_supabase:
+            st.info("Camera requires Supabase connection in cloud mode. Please upload a photo below.")
+            img_file = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png"], key="cloud_upload")
+        else:
+            img_file = st.camera_input("Look at the camera and click 'Take Photo'")
+            if img_file is None:
+                st.markdown("---")
+                st.markdown("**Or upload a photo:**")
+                img_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"], key="fallback_upload")
 
     with data_col:
         st.subheader("🔍 Scan Result")
@@ -204,87 +236,86 @@ if choice == "📸 Face Scanner":
                 b64_img = opencv_to_base64(img_with_boxes)
                 st.image(f"data:image/jpeg;base64,{b64_img}", caption=f"{len(faces)} face(s) detected", use_container_width=True)
 
-                use_supabase = bool(st.session_state.get("supabase_url"))
-                cache_key = "sb_hash" if use_supabase else "local_hash"
-                recognizer_key = "sb_recognizer" if use_supabase else "local_recognizer"
-                idmap_key = "sb_idmap" if use_supabase else "local_idmap"
-
-                if use_supabase:
-                    current_hash = db.get_db_hash()
+                if not HAS_FACE_RECOGNIZER:
+                    profile_placeholder.warning("Face detection works but recognition requires opencv-contrib. Install it with: `pip install opencv-contrib-python-headless`")
                 else:
-                    current_hash = get_local_db_hash()
+                    cache_key = "sb_hash" if use_supabase else "local_hash"
+                    recognizer_key = "sb_recognizer" if use_supabase else "local_recognizer"
+                    idmap_key = "sb_idmap" if use_supabase else "local_idmap"
 
-                if st.session_state.get(cache_key) != current_hash:
                     if use_supabase:
-                        rec, idmap = train_face_recognizer_supabase()
+                        current_hash = db.get_db_hash()
                     else:
-                        rec, idmap = train_face_recognizer_local()
-                    st.session_state[recognizer_key] = rec
-                    st.session_state[idmap_key] = idmap
-                    st.session_state[cache_key] = current_hash
+                        current_hash = get_local_db_hash()
 
-                recognizer = st.session_state.get(recognizer_key)
-                id_map = st.session_state.get(idmap_key, {})
-                matched_student = None
-
-                if recognizer is not None:
-                    (x, y, w, h) = faces[0]
-                    face_roi = align_and_resize_face(gray, x, y, w, h)
-                    label_id, confidence = recognizer.predict(face_roi)
-
-                    if confidence < 50 and label_id in id_map:
-                        target_id = id_map[label_id]
+                    if st.session_state.get(cache_key) != current_hash:
                         if use_supabase:
-                            matched_student = db.get_student_by_id(target_id)
-                            if matched_student:
-                                matched_student = (
-                                    matched_student.get("admission_id"),
-                                    matched_student.get("name"),
-                                    matched_student.get("roll_no"),
-                                    matched_student.get("department"),
-                                    matched_student.get("semester"),
-                                    matched_student.get("image_url", "")
-                                )
+                            students = db.get_all_students()
+                            records = [(s["admission_id"], s.get("image_url", "")) for s in students]
                         else:
-                            conn = sqlite3.connect(DB_PATH)
-                            c = conn.cursor()
-                            c.execute("SELECT admission_id, name, roll_no, department, semester, image_path FROM students WHERE admission_id=?", (target_id,))
-                            matched_student = c.fetchone()
-                            conn.close()
+                            records = [(r[0], r[5]) for r in get_local_students()]
 
-                if matched_student:
-                    img_path = matched_student[5]
-                    if img_path and img_path.startswith("http"):
-                        img_src = img_path
-                    elif img_path and os.path.exists(img_path):
-                        with open(img_path, "rb") as f:
-                            b64 = base64.b64encode(f.read()).decode()
-                        img_src = f"data:image/jpeg;base64,{b64}"
+                        rec, idmap = train_from_records(records, use_url=use_supabase)
+                        st.session_state[recognizer_key] = rec
+                        st.session_state[idmap_key] = idmap
+                        st.session_state[cache_key] = current_hash
+
+                    recognizer = st.session_state.get(recognizer_key)
+                    id_map = st.session_state.get(idmap_key, {})
+                    matched_student = None
+
+                    if recognizer is not None:
+                        (x, y, w, h) = faces[0]
+                        face_roi = align_and_resize_face(gray, x, y, w, h)
+                        label_id, confidence = recognizer.predict(face_roi)
+
+                        if confidence < 50 and label_id in id_map:
+                            target_id = id_map[label_id]
+                            if use_supabase:
+                                s = db.get_student_by_id(target_id)
+                                if s:
+                                    matched_student = (s.get("admission_id"), s.get("name"), s.get("roll_no"),
+                                                       s.get("department"), s.get("semester"), s.get("image_url", ""))
+                            else:
+                                rows = get_local_students()
+                                for r in rows:
+                                    if r[0] == target_id:
+                                        matched_student = r
+                                        break
+
+                    if matched_student:
+                        img_path = matched_student[5]
+                        if img_path and img_path.startswith("http"):
+                            img_src = img_path
+                        elif img_path and os.path.exists(img_path):
+                            with open(img_path, "rb") as f:
+                                b64 = base64.b64encode(f.read()).decode()
+                            img_src = f"data:image/jpeg;base64,{b64}"
+                        else:
+                            img_src = "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
+
+                        profile_placeholder.markdown(f"""
+                        <div class='profile-card-success'>
+                            <img src='{img_src}' class='avatar-large'>
+                            <div>
+                                <h4 style='color:#16a34a; margin:0 0 4px 0;'>Verified Student</h4>
+                                <h5 style='margin:0 0 4px 0; color:#0f172a;'><b>Name:</b> {matched_student[1]}</h5>
+                                <p style='margin:0; font-size:13px; color:#334155;'><b>ID:</b> {matched_student[0]} | <b>Roll:</b> {matched_student[2]}</p>
+                                <p style='margin:0; font-size:13px; color:#0284c7;'><b>Major:</b> {matched_student[3]}</p>
+                                <p style='margin:0; font-size:12px; color:#64748b;'><b>Semester:</b> {matched_student[4]}</p>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
                     else:
-                        img_src = "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
-
-                    profile_placeholder.markdown(f"""
-                    <div class='profile-card-success'>
-                        <img src='{img_src}' class='avatar-large'>
-                        <div>
-                            <h4 style='color:#16a34a; margin:0 0 4px 0;'>Verified Student</h4>
-                            <h5 style='margin:0 0 4px 0; color:#0f172a;'><b>Name:</b> {matched_student[1]}</h5>
-                            <p style='margin:0; font-size:13px; color:#334155;'><b>ID:</b> {matched_student[0]} | <b>Roll:</b> {matched_student[2]}</p>
-                            <p style='margin:0; font-size:13px; color:#0284c7;'><b>Major:</b> {matched_student[3]}</p>
-                            <p style='margin:0; font-size:12px; color:#64748b;'><b>Semester:</b> {matched_student[4]}</p>
+                        profile_placeholder.markdown("""
+                        <div class='profile-card-unknown'>
+                            <img src='https://cdn-icons-png.flaticon.com/512/57/57708.png' class='avatar-large'>
+                            <div>
+                                <h4 style='color:#dc2626; margin:0 0 4px 0;'>Unknown Person</h4>
+                                <p style='margin:0; font-size:13px; color:#7f1d1d;'>This person is not registered in the database.</p>
+                            </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    profile_placeholder.markdown("""
-                    <div class='profile-card-unknown'>
-                        <img src='https://cdn-icons-png.flaticon.com/512/57/57708.png' class='avatar-large'>
-                        <div>
-                            <h4 style='color:#dc2626; margin:0 0 4px 0;'>Unknown Person</h4>
-                            <p style='margin:0; font-size:13px; color:#7f1d1d;'>This person is not registered in the database.</p>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
             else:
                 profile_placeholder.error("No face detected in the image. Please try again.")
         else:
@@ -293,33 +324,23 @@ if choice == "📸 Face Scanner":
 
 elif choice == "🔒 Admin Panel":
     if st.session_state.logged_in:
-        st.sidebar.success(f"Logged in as Admin")
+        st.sidebar.success("Logged in as Admin")
         if st.sidebar.button("Logout"):
             st.session_state.logged_in = False
             st.rerun()
 
-        admin_menu = [
-            "Dashboard",
-            "Register Student",
-            "Edit / Delete Records",
-            "API Settings"
-        ]
+        admin_menu = ["Dashboard", "Register Student", "Edit / Delete Records", "API Settings"]
         admin_choice = st.sidebar.radio("Admin Functions", admin_menu)
         st.write("---")
 
         if admin_choice == "Dashboard":
             st.header("Dashboard")
 
-            use_supabase = bool(st.session_state.get("supabase_url"))
             if use_supabase:
-                records = db.get_all_students()
-                records = [(s["admission_id"], s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) for s in records]
+                students = db.get_all_students()
+                records = [(s["admission_id"], s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) for s in students]
             else:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT admission_id, name, roll_no, department, semester, image_path FROM students")
-                records = c.fetchall()
-                conn.close()
+                records = get_local_students()
 
             if records:
                 st.metric(label="Total Registered Students", value=len(records))
@@ -340,8 +361,6 @@ elif choice == "🔒 Admin Panel":
 
         elif admin_choice == "Register Student":
             st.header("Register New Student")
-
-            use_supabase = bool(st.session_state.get("supabase_url"))
 
             with st.form("reg_form", clear_on_submit=True):
                 adm_id = st.text_input("Admission ID *")
@@ -365,14 +384,8 @@ elif choice == "🔒 Admin Panel":
                                 ok, msg = db.add_student(adm_id, s_name, r_no, dept, seme, image_url)
                             else:
                                 file_path = os.path.join(IMG_FOLDER, f"{adm_id}.jpg")
-                                with open(file_path, "wb") as f:
-                                    f.write(uploaded_file.getbuffer())
-                                conn = sqlite3.connect(DB_PATH)
-                                c = conn.cursor()
-                                c.execute("INSERT OR REPLACE INTO students VALUES (?, ?, ?, ?, ?, ?)",
-                                          (adm_id, s_name, r_no, dept, seme, file_path))
-                                conn.commit()
-                                conn.close()
+                                save_local_student(adm_id, s_name, r_no, dept, seme,
+                                                   file_bytes=uploaded_file.getbuffer(), file_path=file_path)
                                 ok, msg = True, "Student registered successfully!"
 
                             for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
@@ -386,17 +399,12 @@ elif choice == "🔒 Admin Panel":
         elif admin_choice == "Edit / Delete Records":
             st.header("Manage Student Records")
 
-            use_supabase = bool(st.session_state.get("supabase_url"))
-
             if use_supabase:
                 students = db.get_all_students()
                 student_list = [(s["admission_id"], s["name"]) for s in students]
             else:
-                conn = sqlite3.connect(DB_PATH)
-                c = conn.cursor()
-                c.execute("SELECT admission_id, name FROM students")
-                student_list = c.fetchall()
-                conn.close()
+                rows = get_local_students()
+                student_list = [(r[0], r[1]) for r in rows]
 
             if student_list:
                 options = [f"{s[0]} - {s[1]}" for s in student_list]
@@ -407,11 +415,12 @@ elif choice == "🔒 Admin Panel":
                     s = db.get_student_by_id(target_id)
                     curr_data = (s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) if s else None
                 else:
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    c.execute("SELECT name, roll_no, department, semester, image_path FROM students WHERE admission_id=?", (target_id,))
-                    curr_data = c.fetchone()
-                    conn.close()
+                    rows = get_local_students()
+                    curr_data = None
+                    for r in rows:
+                        if r[0] == target_id:
+                            curr_data = (r[1], r[2], r[3], r[4], r[5])
+                            break
 
                 if curr_data:
                     edit_col, view_col = st.columns([1.2, 1])
@@ -438,6 +447,7 @@ elif choice == "🔒 Admin Panel":
                                 if use_supabase:
                                     ok, msg = db.update_student(target_id, up_name, up_roll, up_dept, up_seme)
                                 else:
+                                    import sqlite3
                                     conn = sqlite3.connect(DB_PATH)
                                     c = conn.cursor()
                                     c.execute("UPDATE students SET name=?, roll_no=?, department=?, semester=? WHERE admission_id=?",
@@ -462,14 +472,7 @@ elif choice == "🔒 Admin Panel":
                         if use_supabase:
                             ok, msg = db.delete_student(target_id)
                         else:
-                            img_path = curr_data[4]
-                            if img_path and os.path.exists(img_path):
-                                os.remove(img_path)
-                            conn = sqlite3.connect(DB_PATH)
-                            c = conn.cursor()
-                            c.execute("DELETE FROM students WHERE admission_id=?", (target_id,))
-                            conn.commit()
-                            conn.close()
+                            delete_local_student(target_id)
                             ok, msg = True, "Deleted!"
 
                         for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
@@ -486,6 +489,9 @@ elif choice == "🔒 Admin Panel":
         elif admin_choice == "API Settings":
             st.header("Supabase API Settings")
             st.markdown("Configure your Supabase connection for cloud database storage.")
+
+            if not SUPABASE_AVAILABLE:
+                st.error("Supabase library not installed. Add `supabase` to requirements.txt")
 
             with st.expander("How to set up Supabase", expanded=not bool(st.session_state.get("supabase_url"))):
                 st.markdown("""
@@ -559,11 +565,11 @@ elif choice == "🔒 Admin Panel":
             st.write("---")
             st.subheader("Connection Status")
             if st.session_state.get("supabase_url"):
-                st.markdown(f"**Mode:** Cloud (Supabase)")
+                st.markdown("**Mode:** Cloud (Supabase)")
                 st.markdown(f"**URL:** `{st.session_state.get('supabase_url', '')}`")
                 ok, msg = db.test_connection()
                 if ok:
-                    st.markdown(f"**Status:** <span class='status-ok'>Connected</span>", unsafe_allow_html=True)
+                    st.markdown("**Status:** <span class='status-ok'>Connected</span>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"**Status:** <span class='status-err'>Error - {msg}</span>", unsafe_allow_html=True)
             else:
