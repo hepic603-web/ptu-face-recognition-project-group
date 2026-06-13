@@ -1,0 +1,7 @@
+streamlit
+numpy
+opencv-python-headless
+opencv-contrib-python-headless
+supabase
+Pillow
+requests
