@@ -1,6 +1,4 @@
-streamlit
-numpy
+streamlit>=1.30.0
+numpy<2.0.0
 opencv-python-headless
-supabase
-Pillow
-requests
+face-recognition
