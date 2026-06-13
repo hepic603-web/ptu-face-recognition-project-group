@@ -1,30 +1,33 @@
 import hashlib
 
+SUPABASE_PKG_AVAILABLE = False
+_supabase_st = None
+_create_client = None
+
 try:
-    import streamlit as st
-    from supabase import create_client, Client
+    import streamlit as _supabase_st
+    from supabase import create_client as _create_client
     SUPABASE_PKG_AVAILABLE = True
 except Exception:
-    SUPABASE_PKG_AVAILABLE = False
-    st = None
+    pass
 
 BUCKET_NAME = "registered_faces"
 
 def _check():
     if not SUPABASE_PKG_AVAILABLE:
-        return None, "supabase package not installed"
+        return False, "supabase package not installed"
     return True, None
 
 def get_client():
-    ok, err = _check()
+    ok, _ = _check()
     if not ok:
         return None
-    url = st.session_state.get("supabase_url", "").strip()
-    key = st.session_state.get("supabase_key", "").strip()
+    url = _supabase_st.session_state.get("supabase_url", "").strip()
+    key = _supabase_st.session_state.get("supabase_key", "").strip()
     if not url or not key:
         return None
     try:
-        return create_client(url, key)
+        return _create_client(url, key)
     except Exception:
         return None
 

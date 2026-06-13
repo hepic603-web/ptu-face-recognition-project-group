@@ -13,12 +13,35 @@ CV2_AVAILABLE = False
 HAS_FACE_RECOGNIZER = False
 np = None
 cv2 = None
-
 try:
     import numpy as np
     import cv2
     CV2_AVAILABLE = True
     HAS_FACE_RECOGNIZER = hasattr(cv2, 'face') and hasattr(cv2.face, 'LBPHFaceRecognizer_create')
+except Exception:
+    pass
+
+WEBRTC_AVAILABLE = False
+WEBRTC_USE_TRANSFORM = True
+webrtc_streamer = None
+WebRtcMode = None
+RTCConfiguration = None
+VideoTransformerBase = None
+VideoProcessorBase = None
+
+# Thread-safe shared dict for live video processor
+_LIVE_DATA = {"rec": None, "idmap": {}, "match_result": None}
+
+try:
+    import av
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+    try:
+        from streamlit_webrtc import VideoTransformerBase
+        WEBRTC_USE_TRANSFORM = True
+    except ImportError:
+        from streamlit_webrtc import VideoProcessorBase
+        WEBRTC_USE_TRANSFORM = False
+    WEBRTC_AVAILABLE = True
 except Exception:
     pass
 
@@ -38,10 +61,17 @@ st.set_page_config(
 st.markdown("""
 <style>
     @media (max-width: 768px) {
-        .block-container { padding: 1rem 0.5rem; }
-        h1 { font-size: 1.4rem !important; }
-        h2 { font-size: 1.2rem !important; }
-        h3 { font-size: 1rem !important; }
+        .block-container { padding: 0.75rem 0.4rem; }
+        h1 { font-size: 1.3rem !important; }
+        h2 { font-size: 1.1rem !important; }
+        h3 { font-size: 0.95rem !important; }
+        .stTabs [data-baseweb="tab"] { font-size: 0.8rem !important; padding: 6px 12px !important; }
+        .profile-card-success, .profile-card-unknown { flex-direction: column !important; text-align: center !important; }
+        .avatar-large { width: 70px !important; height: 70px !important; }
+    }
+    @media (max-width: 480px) {
+        .profile-card-success, .profile-card-unknown { padding: 12px !important; }
+        .avatar-large { width: 60px !important; height: 60px !important; }
     }
     .profile-card-success {
         background: white; border-left: 6px solid #22c55e; padding: 18px;
@@ -59,6 +89,7 @@ st.markdown("""
     }
     .status-ok { color: #16a34a; font-weight: bold; }
     .status-err { color: #dc2626; font-weight: bold; }
+    .result-container { min-height: 300px; display: flex; flex-direction: column; justify-content: center; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -111,7 +142,8 @@ def save_local_student(adm_id, name, r_no, dept, seme, file_bytes=None, file_pat
             f.write(file_bytes)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS students (admission_id TEXT PRIMARY KEY, name TEXT, roll_no TEXT, department TEXT, semester TEXT, image_path TEXT)")
+    c.execute("""CREATE TABLE IF NOT EXISTS students
+                 (admission_id TEXT PRIMARY KEY, name TEXT, roll_no TEXT, department TEXT, semester TEXT, image_path TEXT)""")
     c.execute("INSERT OR REPLACE INTO students VALUES (?, ?, ?, ?, ?, ?)",
               (adm_id, name, r_no, dept, seme, file_path or ""))
     conn.commit()
@@ -131,7 +163,6 @@ def delete_local_student(adm_id):
     conn.commit()
     conn.close()
 
-
 FACE_SIZE = (150, 150)
 
 def align_and_resize_face(gray_img, x, y, w, h):
@@ -140,11 +171,12 @@ def align_and_resize_face(gray_img, x, y, w, h):
     face = cv2.equalizeHist(face)
     return face
 
-def draw_face_boxes(opencv_img, faces):
-    for (x, y, w, h) in faces:
-        cv2.rectangle(opencv_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(opencv_img, "Face", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    return opencv_img
+def draw_face_boxes(img, faces, labels=None):
+    for i, (x, y, w, h) in enumerate(faces):
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        label = labels[i] if labels and i < len(labels) else "Face"
+        cv2.putText(img, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    return img
 
 def opencv_to_base64(img):
     _, buf = cv2.imencode('.jpg', img)
@@ -157,172 +189,301 @@ def train_from_records(records, use_url=False):
     face_samples = []
     ids = []
     id_map = {}
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-    for index, (adm_id, img_source) in enumerate(records):
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    for index, (adm_id, src) in enumerate(records):
         try:
-            if use_url and img_source and img_source.startswith("http"):
-                resp = requests.get(img_source, timeout=10)
-                file_bytes = np.asarray(bytearray(resp.content), dtype=np.uint8)
-                img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-            elif not use_url and img_source and os.path.exists(img_source):
-                img = cv2.imread(img_source, cv2.IMREAD_GRAYSCALE)
+            if use_url and src and src.startswith("http"):
+                resp = requests.get(src, timeout=10)
+                fb = np.asarray(bytearray(resp.content), dtype=np.uint8)
+                img = cv2.imdecode(fb, cv2.IMREAD_GRAYSCALE)
+            elif not use_url and src and os.path.exists(src):
+                img = cv2.imread(src, cv2.IMREAD_GRAYSCALE)
             else:
                 continue
-
-            faces = face_cascade.detectMultiScale(img, 1.1, 4)
+            faces = cascade.detectMultiScale(img, 1.1, 4)
             for (x, y, w, h) in faces:
-                aligned = align_and_resize_face(img, x, y, w, h)
-                face_samples.append(aligned)
+                face_samples.append(align_and_resize_face(img, x, y, w, h))
                 ids.append(index)
                 id_map[index] = adm_id
         except Exception:
             continue
-
-    if len(face_samples) == 0:
+    if not face_samples:
         return None, {}
-
     recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
     recognizer.train(face_samples, np.array(ids))
     return recognizer, id_map
 
+def get_recognizer(use_supabase):
+    cache_key = "sb_hash" if use_supabase else "local_hash"
+    rec_key = "sb_recognizer" if use_supabase else "local_recognizer"
+    idm_key = "sb_idmap" if use_supabase else "local_idmap"
+    cur_hash = db.get_db_hash() if use_supabase else get_local_db_hash()
+    if st.session_state.get(cache_key) != cur_hash:
+        if use_supabase:
+            students = db.get_all_students()
+            records = [(s["admission_id"], s.get("image_url", "")) for s in students]
+        else:
+            records = [(r[0], r[5]) for r in get_local_students()]
+        rec, idmap = train_from_records(records, use_url=use_supabase)
+        st.session_state[rec_key] = rec
+        st.session_state[idm_key] = idmap
+        st.session_state[cache_key] = cur_hash
+    return st.session_state.get(rec_key), st.session_state.get(idm_key, {})
+
+def lookup_student(target_id, use_supabase):
+    if use_supabase:
+        s = db.get_student_by_id(target_id)
+        if s:
+            return (s.get("admission_id"), s.get("name"), s.get("roll_no"),
+                    s.get("department"), s.get("semester"), s.get("image_url", ""))
+        return None
+    for r in get_local_students():
+        if r[0] == target_id:
+            return r
+    return None
+
+def render_student_card(student, placeholder=None):
+    img_src = student[5] if student[5] and student[5].startswith("http") else (
+        student[5] if student[5] and os.path.exists(student[5]) else
+        "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
+    )
+    card = f"""
+    <div class='profile-card-success'>
+        <img src='{img_src}' class='avatar-large'>
+        <div>
+            <h4 style='color:#16a34a; margin:0 0 4px 0;'>Verified Student</h4>
+            <h5 style='margin:0 0 4px 0; color:#0f172a;'><b>Name:</b> {student[1]}</h5>
+            <p style='margin:0; font-size:13px; color:#334155;'><b>ID:</b> {student[0]} | <b>Roll:</b> {student[2]}</p>
+            <p style='margin:0; font-size:13px; color:#0284c7;'><b>Major:</b> {student[3]}</p>
+            <p style='margin:0; font-size:12px; color:#64748b;'><b>Semester:</b> {student[4]}</p>
+        </div>
+    </div>
+    """
+    if placeholder:
+        placeholder.markdown(card, unsafe_allow_html=True)
+    return card
+
+def render_unknown_card(placeholder=None):
+    card = """
+    <div class='profile-card-unknown'>
+        <img src='https://cdn-icons-png.flaticon.com/512/57/57708.png' class='avatar-large'>
+        <div>
+            <h4 style='color:#dc2626; margin:0 0 4px 0;'>Unknown Person</h4>
+            <p style='margin:0; font-size:13px; color:#7f1d1d;'>This person is not registered in the database.</p>
+        </div>
+    </div>
+    """
+    if placeholder:
+        placeholder.markdown(card, unsafe_allow_html=True)
+    return card
 
 st.sidebar.title("PTU Systems")
-
 use_supabase = bool(st.session_state.get("supabase_url") and SUPABASE_AVAILABLE)
 
 if CV2_AVAILABLE:
-    st.sidebar.success("Camera: Ready")
+    st.sidebar.success("Camera Module: Ready")
 else:
-    st.sidebar.warning("Camera: Not Available")
+    st.sidebar.warning("Camera Module: Not Available")
 
 if use_supabase:
-    st.sidebar.success("Database: Supabase")
+    st.sidebar.success("Database: Supabase Cloud")
 else:
     st.sidebar.info("Database: Local SQLite")
+
+if WEBRTC_AVAILABLE:
+    pass
+else:
+    st.sidebar.info("Live Video: Install streamlit-webrtc")
 
 menu = ["Face Scanner", "Admin Panel"]
 choice = st.sidebar.selectbox("Navigation", menu)
 
-
 if choice == "Face Scanner":
-    st.header("Face Verification")
-    st.caption("Take a photo or upload an image to verify against the database.")
+    st.header("Face Recognition Scanner")
+    st.caption("Verify a person's identity by scanning their face against the database.")
 
     if not CV2_AVAILABLE:
-        st.error("OpenCV is not installed. Face detection requires OpenCV. Run: `pip install opencv-python-headless numpy`")
+        st.error("OpenCV is not available. Install it: `pip install opencv-python-headless numpy`")
         st.stop()
 
-    cam_col, data_col = st.columns([1.1, 1])
+    tab_photo, tab_live = st.tabs([" Take Photo ", " Live Video "])
 
-    with cam_col:
-        st.subheader("Camera")
-        img_file = st.camera_input("Click 'Take Photo' to capture")
-        if img_file is None:
-            st.markdown("---")
-            st.markdown("**Or upload a photo:**")
-            img_file = st.file_uploader("Choose an image file", type=["jpg", "jpeg", "png"])
+    with tab_photo:
+        st.subheader("Capture a Photo")
+        left, right = st.columns([1.1, 1])
+        with left:
+            img_file = st.camera_input("Click 'Take Photo' to capture", key="take_photo_cam")
+            if img_file is None:
+                st.markdown("**Or upload a photo:**")
+                img_file = st.file_uploader("Choose image", type=["jpg", "jpeg", "png"], key="photo_upload")
+        with right:
+            with st.container():
+                st.markdown('<div class="result-container">', unsafe_allow_html=True)
+                ph = st.empty()
+                st.markdown('</div>', unsafe_allow_html=True)
 
-    with data_col:
-        st.subheader("Result")
-        profile_placeholder = st.empty()
+                if img_file is not None:
+                    fb = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
+                    oimg = cv2.imdecode(fb, 1)
+                    gray = cv2.cvtColor(oimg, cv2.COLOR_BGR2GRAY)
+                    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                    faces = cascade.detectMultiScale(gray, 1.1, 4)
 
-        if img_file is not None:
-            file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-            opencv_img = cv2.imdecode(file_bytes, 1)
-            gray = cv2.cvtColor(opencv_img, cv2.COLOR_BGR2GRAY)
+                    if len(faces) > 0:
+                        boxed = draw_face_boxes(oimg.copy(), faces)
+                        st.image(f"data:image/jpeg;base64,{opencv_to_base64(boxed)}",
+                                 caption=f"{len(faces)} face(s) detected", use_container_width=True)
 
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-
-            if len(faces) > 0:
-                img_with_boxes = draw_face_boxes(opencv_img.copy(), faces)
-                b64_img = opencv_to_base64(img_with_boxes)
-                st.image(f"data:image/jpeg;base64,{b64_img}", caption=f"{len(faces)} face(s) detected", use_container_width=True)
-
-                if not HAS_FACE_RECOGNIZER:
-                    profile_placeholder.warning("Face detected but recognition unavailable. Install opencv-contrib-python-headless for recognition.")
-                else:
-                    cache_key = "sb_hash" if use_supabase else "local_hash"
-                    recognizer_key = "sb_recognizer" if use_supabase else "local_recognizer"
-                    idmap_key = "sb_idmap" if use_supabase else "local_idmap"
-
-                    if use_supabase:
-                        current_hash = db.get_db_hash()
-                    else:
-                        current_hash = get_local_db_hash()
-
-                    if st.session_state.get(cache_key) != current_hash:
-                        if use_supabase:
-                            students = db.get_all_students()
-                            records = [(s["admission_id"], s.get("image_url", "")) for s in students]
+                        if not HAS_FACE_RECOGNIZER:
+                            st.warning("Face detected. Install opencv-contrib-python-headless for recognition.")
                         else:
-                            records = [(r[0], r[5]) for r in get_local_students()]
-
-                        rec, idmap = train_from_records(records, use_url=use_supabase)
-                        st.session_state[recognizer_key] = rec
-                        st.session_state[idmap_key] = idmap
-                        st.session_state[cache_key] = current_hash
-
-                    recognizer = st.session_state.get(recognizer_key)
-                    id_map = st.session_state.get(idmap_key, {})
-                    matched_student = None
-
-                    if recognizer is not None:
-                        (x, y, w, h) = faces[0]
-                        face_roi = align_and_resize_face(gray, x, y, w, h)
-                        label_id, confidence = recognizer.predict(face_roi)
-
-                        if confidence < 50 and label_id in id_map:
-                            target_id = id_map[label_id]
-                            if use_supabase:
-                                s = db.get_student_by_id(target_id)
-                                if s:
-                                    matched_student = (s.get("admission_id"), s.get("name"), s.get("roll_no"),
-                                                       s.get("department"), s.get("semester"), s.get("image_url", ""))
+                            rec, idmap = get_recognizer(use_supabase)
+                            matched = None
+                            if rec is not None:
+                                (x, y, w, h) = faces[0]
+                                roi = align_and_resize_face(gray, x, y, w, h)
+                                lid, conf = rec.predict(roi)
+                                if conf < 50 and lid in idmap:
+                                    matched = lookup_student(idmap[lid], use_supabase)
+                            if matched:
+                                render_student_card(matched, ph)
                             else:
-                                for r in get_local_students():
-                                    if r[0] == target_id:
-                                        matched_student = r
-                                        break
-
-                    if matched_student:
-                        img_path = matched_student[5]
-                        if img_path and img_path.startswith("http"):
-                            img_src = img_path
-                        elif img_path and os.path.exists(img_path):
-                            with open(img_path, "rb") as f:
-                                b64 = base64.b64encode(f.read()).decode()
-                            img_src = f"data:image/jpeg;base64,{b64}"
-                        else:
-                            img_src = "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
-
-                        profile_placeholder.markdown(f"""
-                        <div class='profile-card-success'>
-                            <img src='{img_src}' class='avatar-large'>
-                            <div>
-                                <h4 style='color:#16a34a; margin:0 0 4px 0;'>Verified Student</h4>
-                                <h5 style='margin:0 0 4px 0; color:#0f172a;'><b>Name:</b> {matched_student[1]}</h5>
-                                <p style='margin:0; font-size:13px; color:#334155;'><b>ID:</b> {matched_student[0]} | <b>Roll:</b> {matched_student[2]}</p>
-                                <p style='margin:0; font-size:13px; color:#0284c7;'><b>Major:</b> {matched_student[3]}</p>
-                                <p style='margin:0; font-size:12px; color:#64748b;'><b>Semester:</b> {matched_student[4]}</p>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                                render_unknown_card(ph)
                     else:
-                        profile_placeholder.markdown("""
-                        <div class='profile-card-unknown'>
-                            <img src='https://cdn-icons-png.flaticon.com/512/57/57708.png' class='avatar-large'>
-                            <div>
-                                <h4 style='color:#dc2626; margin:0 0 4px 0;'>Unknown Person</h4>
-                                <p style='margin:0; font-size:13px; color:#7f1d1d;'>This person is not registered in the database.</p>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        ph.error("No face detected.")
+                else:
+                    ph.info("Position your face and click 'Take Photo'.")
+
+    with tab_live:
+        st.subheader("Live Video Feed")
+        st.caption("Real-time face detection and recognition. Allow camera access when prompted.")
+
+        if not WEBRTC_AVAILABLE:
+            st.warning("Live Video mode requires `streamlit-webrtc`. Install it:")
+            st.code("pip install streamlit-webrtc")
+            st.info("In the meantime, use the 'Take Photo' tab above.")
+            st.stop()
+
+        if not HAS_FACE_RECOGNIZER:
+            st.warning("Recognition unavailable (opencv-contrib not installed). Detection only.")
+
+        rec, idmap = get_recognizer(use_supabase)
+        _LIVE_DATA["rec"] = rec
+        _LIVE_DATA["idmap"] = idmap
+        _LIVE_DATA["match_result"] = None
+
+        if WEBRTC_AVAILABLE:
+            if WEBRTC_USE_TRANSFORM:
+                class FaceProcessor(VideoTransformerBase):
+                    def __init__(self):
+                        self.cascade = cv2.CascadeClassifier(
+                            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                        )
+                        self.last_match_id = None
+
+                    def transform(self, frame):
+                        data = _LIVE_DATA
+                        img = frame.to_ndarray(format="bgr24")
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        faces = self.cascade.detectMultiScale(gray, 1.1, 4)
+
+                        labels = []
+                        current_match = None
+                        for (x, y, w, h) in faces:
+                            label = "Face"
+                            r = data["rec"]
+                            im = data["idmap"]
+                            if r is not None and im:
+                                roi = align_and_resize_face(gray, x, y, w, h)
+                                lid, conf = r.predict(roi)
+                                if conf < 50 and lid in im:
+                                    target = im[lid]
+                                    label = target
+                                    if current_match is None:
+                                        current_match = target
+                            labels.append(label)
+
+                        draw_face_boxes(img, faces, labels)
+
+                        if current_match and current_match != self.last_match_id:
+                            self.last_match_id = current_match
+                            data["match_result"] = current_match
+                        elif current_match is None:
+                            self.last_match_id = None
+                            data["match_result"] = None
+
+                        return av.VideoFrame.from_ndarray(img, format="bgr24")
             else:
-                profile_placeholder.error("No face detected. Please try again.")
-        else:
-            profile_placeholder.info("Position your face and click 'Take Photo'.")
+                class FaceProcessor(VideoProcessorBase):
+                    def __init__(self):
+                        self.cascade = cv2.CascadeClassifier(
+                            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                        )
+                        self.last_match_id = None
+
+                    def recv(self, frame):
+                        data = _LIVE_DATA
+                        img = frame.to_ndarray(format="bgr24")
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        faces = self.cascade.detectMultiScale(gray, 1.1, 4)
+
+                        labels = []
+                        current_match = None
+                        for (x, y, w, h) in faces:
+                            label = "Face"
+                            r = data["rec"]
+                            im = data["idmap"]
+                            if r is not None and im:
+                                roi = align_and_resize_face(gray, x, y, w, h)
+                                lid, conf = r.predict(roi)
+                                if conf < 50 and lid in im:
+                                    target = im[lid]
+                                    label = target
+                                    if current_match is None:
+                                        current_match = target
+                            labels.append(label)
+
+                        draw_face_boxes(img, faces, labels)
+
+                        if current_match and current_match != self.last_match_id:
+                            self.last_match_id = current_match
+                            data["match_result"] = current_match
+                        elif current_match is None:
+                            self.last_match_id = None
+                            data["match_result"] = None
+
+                        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+            factory_param = "video_transformer_factory" if WEBRTC_USE_TRANSFORM else "video_processor_factory"
+
+            kw = {
+                "key": "ptu-live-video",
+                "mode": WebRtcMode.SENDRECV,
+                factory_param: FaceProcessor,
+                "rtc_configuration": {
+                    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+                },
+                "media_stream_constraints": {
+                    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}},
+                    "audio": False,
+                },
+                "async_transform": True,
+            }
+
+            webrtc_streamer(**kw)
+
+            st.markdown("---")
+            st.subheader("Live Recognition Result")
+            live_ph = st.empty()
+
+            if _LIVE_DATA["match_result"]:
+                student = lookup_student(_LIVE_DATA["match_result"], use_supabase)
+                if student:
+                    render_student_card(student, live_ph)
+                else:
+                    render_unknown_card(live_ph)
+            else:
+                live_ph.info("Waiting for face detection...")
 
 elif choice == "Admin Panel":
     if st.session_state.logged_in:
@@ -337,25 +498,20 @@ elif choice == "Admin Panel":
 
         if admin_choice == "Dashboard":
             st.header("Dashboard")
-
+            records = db.get_all_students() if use_supabase else get_local_students()
             if use_supabase:
-                students = db.get_all_students()
-                records = [(s["admission_id"], s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) for s in students]
-            else:
-                records = get_local_students()
-
+                records = [(s["admission_id"], s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) for s in records]
             if records:
                 st.metric(label="Total Registered Students", value=len(records))
                 grid = st.columns(3)
-                for index, r in enumerate(records):
-                    col = grid[index % 3]
+                for i, r in enumerate(records):
+                    col = grid[i % 3]
                     with col:
                         with st.container(border=True):
-                            img_src = r[5] if r[5] and r[5].startswith("http") else (
+                            src = r[5] if r[5] and r[5].startswith("http") else (
                                 r[5] if r[5] and os.path.exists(r[5]) else
-                                "https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
-                            )
-                            st.image(img_src, width=110)
+                                "https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+                            st.image(src, width=110)
                             st.markdown(f"**{r[1]}**")
                             st.caption(f"ID: {r[0]} | Major: {r[3]}")
             else:
@@ -363,7 +519,6 @@ elif choice == "Admin Panel":
 
         elif admin_choice == "Register Student":
             st.header("Register New Student")
-
             with st.form("reg_form", clear_on_submit=True):
                 adm_id = st.text_input("Admission ID *")
                 s_name = st.text_input("Full Name *")
@@ -371,7 +526,6 @@ elif choice == "Admin Panel":
                 dept = st.selectbox("Department (Major)", MAJORS_LIST)
                 seme = st.selectbox("Semester", SEMESTERS_LIST)
                 uploaded_file = st.file_uploader("Upload Profile Image *", type=["jpg", "png", "jpeg"])
-
                 if st.form_submit_button("Register Student", type="primary"):
                     if not (adm_id and s_name and r_no and uploaded_file):
                         st.error("Please fill all required fields.")
@@ -385,100 +539,83 @@ elif choice == "Admin Panel":
                                     st.stop()
                                 ok, msg = db.add_student(adm_id, s_name, r_no, dept, seme, image_url)
                             else:
-                                file_path = os.path.join(IMG_FOLDER, f"{adm_id}.jpg")
+                                fp = os.path.join(IMG_FOLDER, f"{adm_id}.jpg")
                                 save_local_student(adm_id, s_name, r_no, dept, seme,
-                                                   file_bytes=uploaded_file.getbuffer(), file_path=file_path)
+                                                   file_bytes=uploaded_file.getbuffer(), file_path=fp)
                                 ok, msg = True, "Student registered successfully!"
-
                             for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
                                 st.session_state.pop(k, None)
-
-                            if ok:
-                                st.success(f"Student {s_name} registered successfully!")
-                            else:
-                                st.error(f"Error: {msg}")
+                            st.success(msg) if ok else st.error(msg)
 
         elif admin_choice == "Edit / Delete Records":
             st.header("Manage Student Records")
-
             if use_supabase:
                 students = db.get_all_students()
                 student_list = [(s["admission_id"], s["name"]) for s in students]
             else:
-                rows = get_local_students()
-                student_list = [(r[0], r[1]) for r in rows]
-
+                student_list = [(r[0], r[1]) for r in get_local_students()]
             if student_list:
-                options = [f"{s[0]} - {s[1]}" for s in student_list]
-                selected = st.selectbox("Select student to manage", options)
+                selected = st.selectbox("Select student", [f"{s[0]} - {s[1]}" for s in student_list])
                 target_id = selected.split(" - ")[0]
-
+                curr_data = None
                 if use_supabase:
                     s = db.get_student_by_id(target_id)
-                    curr_data = (s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url","")) if s else None
+                    if s:
+                        curr_data = (s["name"], s["roll_no"], s["department"], s["semester"], s.get("image_url",""))
                 else:
-                    curr_data = None
                     for r in get_local_students():
                         if r[0] == target_id:
                             curr_data = (r[1], r[2], r[3], r[4], r[5])
                             break
-
                 if curr_data:
-                    edit_col, view_col = st.columns([1.2, 1])
-                    with view_col:
+                    ec, vc = st.columns([1.2, 1])
+                    with vc:
                         st.markdown("**Current Photo**")
-                        img_src = curr_data[4]
-                        if img_src and img_src.startswith("http"):
-                            st.image(img_src, width=150)
-                        elif img_src and os.path.exists(img_src):
-                            st.image(img_src, width=150)
+                        src = curr_data[4]
+                        if src and src.startswith("http"):
+                            st.image(src, width=150)
+                        elif src and os.path.exists(src):
+                            st.image(src, width=150)
                         else:
                             st.caption("No photo found.")
-
-                    with edit_col:
+                    with ec:
                         with st.form("update_form"):
-                            st.markdown("### Edit Student Info")
-                            up_name = st.text_input("Full Name", value=curr_data[0])
-                            up_roll = st.text_input("Roll Number", value=curr_data[1])
-                            up_dept = st.selectbox("Department", MAJORS_LIST,
+                            up_n = st.text_input("Full Name", value=curr_data[0])
+                            up_r = st.text_input("Roll Number", value=curr_data[1])
+                            up_d = st.selectbox("Department", MAJORS_LIST,
                                 index=MAJORS_LIST.index(curr_data[2]) if curr_data[2] in MAJORS_LIST else 0)
-                            up_seme = st.selectbox("Semester", SEMESTERS_LIST,
+                            up_s = st.selectbox("Semester", SEMESTERS_LIST,
                                 index=SEMESTERS_LIST.index(curr_data[3]) if curr_data[3] in SEMESTERS_LIST else 0)
                             if st.form_submit_button("Save Changes", type="primary"):
                                 if use_supabase:
-                                    ok, msg = db.update_student(target_id, up_name, up_roll, up_dept, up_seme)
+                                    ok, msg = db.update_student(target_id, up_n, up_r, up_d, up_s)
                                 else:
                                     import sqlite3
                                     conn = sqlite3.connect(DB_PATH)
                                     c = conn.cursor()
                                     c.execute("UPDATE students SET name=?, roll_no=?, department=?, semester=? WHERE admission_id=?",
-                                              (up_name, up_roll, up_dept, up_seme, target_id))
+                                              (up_n, up_r, up_d, up_s, target_id))
                                     conn.commit()
                                     conn.close()
                                     ok, msg = True, "Updated!"
-
                                 for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
                                     st.session_state.pop(k, None)
-
                                 if ok:
                                     st.success(msg)
                                     st.rerun()
                                 else:
                                     st.error(msg)
-
                     st.write("---")
                     st.markdown("### Danger Zone")
-                    confirm = st.checkbox(f"I confirm I want to delete {curr_data[0]} ({target_id})")
+                    confirm = st.checkbox(f"I confirm delete {curr_data[0]} ({target_id})")
                     if st.button("Delete Student", type="secondary", disabled=not confirm):
                         if use_supabase:
                             ok, msg = db.delete_student(target_id)
                         else:
                             delete_local_student(target_id)
                             ok, msg = True, "Deleted!"
-
                         for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
                             st.session_state.pop(k, None)
-
                         if ok:
                             st.success(msg)
                             st.rerun()
@@ -489,17 +626,13 @@ elif choice == "Admin Panel":
 
         elif admin_choice == "API Settings":
             st.header("Supabase API Settings")
-            st.markdown("Configure your Supabase connection for cloud database storage.")
-
             if not SUPABASE_AVAILABLE:
-                st.error("Supabase library is not installed. Add `supabase` to requirements.txt and redeploy.")
+                st.error("Supabase package not installed. Add `supabase` to requirements.txt and redeploy.")
             else:
-                with st.expander("How to set up Supabase", expanded=not bool(st.session_state.get("supabase_url"))):
+                with st.expander("Setup Guide", expanded=not bool(st.session_state.get("supabase_url"))):
                     st.markdown("""
-                    **Steps:**
-                    1. Go to [supabase.com](https://supabase.com) and create a free account
-                    2. Create a new project
-                    3. Go to **SQL Editor** and run:
+                    1. Create a free project at [supabase.com](https://supabase.com)
+                    2. In **SQL Editor**, run:
                     ```sql
                     CREATE TABLE students (
                         admission_id TEXT PRIMARY KEY,
@@ -512,47 +645,43 @@ elif choice == "Admin Panel":
                     ALTER TABLE students ENABLE ROW LEVEL SECURITY;
                     CREATE POLICY "Allow all" ON students FOR ALL USING (true) WITH CHECK (true);
                     ```
-                    4. Go to **Storage** -> create bucket `registered_faces` (public)
-                    5. Copy **Project URL** + **Anon Key** from Settings > API
+                    3. In **Storage**, create bucket `registered_faces` (public)
+                    4. Copy **Project URL** + **Anon Key** from Settings > API
                     """)
-
                 with st.form("api_form"):
-                    supabase_url = st.text_input("Supabase Project URL",
-                        value=st.session_state.get("supabase_url", ""),
-                        placeholder="https://xxxxx.supabase.co")
-                    supabase_key = st.text_input("Supabase Anon Key",
-                        value=st.session_state.get("supabase_key", ""),
-                        placeholder="eyJhbGciOiJIUzI1NiIs...",
-                        type="password")
-
-                    cols = st.columns(3)
-                    with cols[0]:
+                    su = st.text_input("Supabase Project URL", value=st.session_state.get("supabase_url", ""),
+                                       placeholder="https://xxxxx.supabase.co")
+                    sk = st.text_input("Supabase Anon Key", value=st.session_state.get("supabase_key", ""),
+                                       placeholder="eyJhbGciOiJIUzI1NiIs...", type="password")
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
                         if st.form_submit_button("Save & Connect", type="primary"):
-                            st.session_state["supabase_url"] = supabase_url.strip()
-                            st.session_state["supabase_key"] = supabase_key.strip()
+                            st.session_state["supabase_url"] = su.strip()
+                            st.session_state["supabase_key"] = sk.strip()
                             for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
                                 st.session_state.pop(k, None)
-                            if supabase_url.strip() and supabase_key.strip():
+                            if su.strip() and sk.strip():
                                 ok, msg = db.test_connection()
-                                st.success(msg) if ok else st.error(msg)
-                    with cols[1]:
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
+                    with c2:
                         if st.form_submit_button("Test Connection"):
-                            st.session_state["supabase_url"] = supabase_url.strip()
-                            st.session_state["supabase_key"] = supabase_key.strip()
+                            st.session_state["supabase_url"] = su.strip()
+                            st.session_state["supabase_key"] = sk.strip()
                             ok, msg = db.test_connection()
                             st.success(msg) if ok else st.error(msg)
-                    with cols[2]:
+                    with c3:
                         if st.form_submit_button("Disconnect"):
                             st.session_state["supabase_url"] = ""
                             st.session_state["supabase_key"] = ""
                             for k in ["sb_hash", "sb_recognizer", "sb_idmap"]:
                                 st.session_state.pop(k, None)
                             st.rerun()
-
                 st.write("---")
                 st.subheader("Connection Status")
-                url_set = bool(st.session_state.get("supabase_url"))
-                if url_set:
+                if st.session_state.get("supabase_url"):
                     st.markdown("**Mode:** Cloud (Supabase)")
                     ok, msg = db.test_connection()
                     tag = "status-ok" if ok else "status-err"
@@ -563,9 +692,9 @@ elif choice == "Admin Panel":
 
     else:
         st.subheader("Admin Login")
-        password_input = st.text_input("Enter Admin Password", type="password")
+        pw = st.text_input("Enter Admin Password", type="password")
         if st.button("Login"):
-            if password_input == ADMIN_PASSWORD:
+            if pw == ADMIN_PASSWORD:
                 st.session_state.logged_in = True
                 st.rerun()
             else:
