@@ -313,9 +313,6 @@ if choice == "Face Scanner":
         left, right = st.columns([1.1, 1])
         with left:
             img_file = st.camera_input("Click 'Take Photo' to capture", key="take_photo_cam")
-            if img_file is None:
-                st.markdown("**Or upload a photo:**")
-                img_file = st.file_uploader("Choose image", type=["jpg", "jpeg", "png"], key="photo_upload")
         with right:
             with st.container():
                 st.markdown('<div class="result-container">', unsafe_allow_html=True)
@@ -545,7 +542,10 @@ elif choice == "Admin Panel":
                                 ok, msg = True, "Student registered successfully!"
                             for k in ["sb_hash", "local_hash", "sb_recognizer", "local_recognizer", "sb_idmap", "local_idmap"]:
                                 st.session_state.pop(k, None)
-                            st.success(msg) if ok else st.error(msg)
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
 
         elif admin_choice == "Edit / Delete Records":
             st.header("Manage Student Records")
@@ -662,16 +662,19 @@ elif choice == "Admin Panel":
                                 st.session_state.pop(k, None)
                             if su.strip() and sk.strip():
                                 ok, msg = db.test_connection()
-                            if ok:
-                                st.success(msg)
-                            else:
-                                st.error(msg)
+                                if ok:
+                                    st.success(msg)
+                                else:
+                                    st.error(msg)
                     with c2:
                         if st.form_submit_button("Test Connection"):
                             st.session_state["supabase_url"] = su.strip()
                             st.session_state["supabase_key"] = sk.strip()
                             ok, msg = db.test_connection()
-                            st.success(msg) if ok else st.error(msg)
+                            if ok:
+                                st.success(msg)
+                            else:
+                                st.error(msg)
                     with c3:
                         if st.form_submit_button("Disconnect"):
                             st.session_state["supabase_url"] = ""
