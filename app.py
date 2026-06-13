@@ -3,9 +3,9 @@ import os
 import base64
 import hashlib
 
-SUPABASE_AVAILABLE = True
 try:
     import supabase_db as db
+    SUPABASE_AVAILABLE = db.SUPABASE_PKG_AVAILABLE
 except Exception:
     SUPABASE_AVAILABLE = False
 
