@@ -2,3 +2,6 @@ streamlit>=1.30.0
 numpy<2.0.0
 opencv-python-headless
 face-recognition
+supabase
+Pillow
+requests
